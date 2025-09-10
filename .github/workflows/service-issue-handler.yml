@@ -42,8 +42,7 @@ jobs:
       - name: Create new repository
         id: create_repo
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ADMIN_TOKEN: ${{ secrets.ADMIN_PAT || secrets.GITHUB_TOKEN }} # PAT 없으면 GITHUB_TOKEN 사용
+          GITHUB_TOKEN: ${{ secrets.ADMIN_PAT || secrets.GITHUB_TOKEN }}
         run: |
           SERVICE_NAME="${{ steps.extract.outputs.service_name }}"
           REPO_NAME="${SERVICE_NAME}-service"
@@ -51,30 +50,41 @@ jobs:
           
           echo "Creating repository: $ORG/$REPO_NAME"
           
-          # GitHub CLI를 사용하여 레포지토리 생성 (PAT가 없어도 작동)
-          gh auth login --with-token <<< "$ADMIN_TOKEN"
-          
-          # 레포지토리 생성 시도
-          if gh repo create "$ORG/$REPO_NAME" \
-            --public \
-            --description "Service repository for $SERVICE_NAME - Auto-generated from issue #${{ github.event.issue.number }}" \
-            --add-readme; then
-            echo "Repository created successfully"
-            echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
-            echo "repo_url=https://github.com/$ORG/$REPO_NAME" >> $GITHUB_OUTPUT
-          else
-            # 레포지토리가 이미 존재하는 경우
-            if gh repo view "$ORG/$REPO_NAME" &>/dev/null; then
-              echo "Repository already exists, using existing repository"
+          # PAT가 있는지 확인
+          if [ -n "${{ secrets.ADMIN_PAT }}" ]; then
+            echo "Using ADMIN_PAT for repository creation"
+            # 레포지토리 생성 시도
+            if gh repo create "$ORG/$REPO_NAME" \
+              --public \
+              --description "Service repository for $SERVICE_NAME - Auto-generated from issue #${{ github.event.issue.number }}" \
+              --add-readme 2>/dev/null; then
+              echo "Repository created successfully"
               echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
               echo "repo_url=https://github.com/$ORG/$REPO_NAME" >> $GITHUB_OUTPUT
             else
-              echo "Failed to create repository"
-              exit 1
+              # 레포지토리가 이미 존재하는 경우
+              if gh repo view "$ORG/$REPO_NAME" &>/dev/null; then
+                echo "Repository already exists, using existing repository"
+                echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+                echo "repo_url=https://github.com/$ORG/$REPO_NAME" >> $GITHUB_OUTPUT
+              else
+                echo "Failed to create repository"
+                exit 1
+              fi
             fi
+          else
+            echo "⚠️ ADMIN_PAT not configured. Cannot create organization repository."
+            echo "Please add ADMIN_PAT secret with repo creation permissions."
+            echo "Instructions: https://github.com/${{ github.repository }}/blob/main/.github/SETUP_SERVICE_WORKFLOW.md"
+            
+            # 대체 방안: 이슈에 댓글로 안내
+            echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+            echo "repo_url=https://github.com/$ORG/$REPO_NAME" >> $GITHUB_OUTPUT
+            echo "repo_creation_failed=true" >> $GITHUB_OUTPUT
           fi
           
       - name: Initialize service repository
+        if: steps.create_repo.outputs.repo_creation_failed != 'true'
         env:
           GH_TOKEN: ${{ secrets.ADMIN_PAT || secrets.GITHUB_TOKEN }}
         run: |
@@ -185,6 +195,7 @@ jobs:
           
       - name: Create issue in new repository
         id: new_issue
+        if: steps.create_repo.outputs.repo_creation_failed != 'true'
         env:
           GH_TOKEN: ${{ secrets.ADMIN_PAT || secrets.GITHUB_TOKEN }}
           ISSUE_TITLE: ${{ github.event.issue.title }}
@@ -244,28 +255,47 @@ jobs:
             const repoName = '${{ steps.create_repo.outputs.repo_name }}';
             const repoUrl = '${{ steps.create_repo.outputs.repo_url }}';
             const org = context.repo.owner;
+            const repoCreationFailed = '${{ steps.create_repo.outputs.repo_creation_failed }}' === 'true';
             
-            // 원본 이슈에 댓글 추가
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `## 🚀 Service Repository Created\n\nA new service repository has been created for this issue:\n\n- **Repository:** [${org}/${repoName}](${repoUrl})\n- **Migrated Issue:** [${repoName}#${{ steps.new_issue.outputs.new_issue_number }}](${repoUrl}/issues/${{ steps.new_issue.outputs.new_issue_number }})\n\n### Next Steps\n1. Continue development in the new repository\n2. This issue will be closed automatically\n3. All further discussions should happen in the new repository`
-            });
-            
-            // 'migrated' 레이블 추가
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              labels: ['migrated']
-            });
-            
-            // 원본 이슈 닫기
-            await github.rest.issues.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              state: 'closed',
-              state_reason: 'completed'
-            });
+            if (repoCreationFailed) {
+              // PAT가 없어서 레포지토리 생성 실패 시
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `## ⚠️ Manual Repository Creation Required\n\n### Repository Name\n\`${repoName}\`\n\n### Why this happened?\nThe workflow needs an ADMIN_PAT secret with repository creation permissions to automatically create organization repositories.\n\n### How to fix:\n1. Create a Personal Access Token with \`repo\` and \`admin:org\` permissions\n2. Add it as a secret named \`ADMIN_PAT\` in repository settings\n3. Re-run this workflow or create a new service issue\n\n### Manual steps:\n1. Create repository: [Create ${repoName}](https://github.com/organizations/${org}/repositories/new?name=${repoName})\n2. Copy issue content to new repository\n3. Close this issue when done\n\n[Setup Instructions](https://github.com/${{ github.repository }}/blob/main/.github/SETUP_SERVICE_WORKFLOW.md)`
+              });
+              
+              // 'needs-manual-setup' 레이블 추가
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: ['needs-manual-setup']
+              });
+            } else {
+              // 정상적으로 레포지토리 생성된 경우
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `## 🚀 Service Repository Created\n\nA new service repository has been created for this issue:\n\n- **Repository:** [${org}/${repoName}](${repoUrl})\n- **Migrated Issue:** [${repoName}#${{ steps.new_issue.outputs.new_issue_number }}](${repoUrl}/issues/${{ steps.new_issue.outputs.new_issue_number }})\n\n### Next Steps\n1. Continue development in the new repository\n2. This issue will be closed automatically\n3. All further discussions should happen in the new repository`
+              });
+              
+              // 'migrated' 레이블 추가
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: ['migrated']
+              });
+              
+              // 원본 이슈 닫기
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                state: 'closed',
+                state_reason: 'completed'
+              });
+            }
