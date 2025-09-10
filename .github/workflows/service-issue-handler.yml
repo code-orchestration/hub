@@ -187,6 +187,11 @@ jobs:
         id: new_issue
         env:
           GH_TOKEN: ${{ secrets.ADMIN_PAT || secrets.GITHUB_TOKEN }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          REPO_URL: ${{ github.repository }}
         run: |
           REPO_NAME="${{ steps.create_repo.outputs.repo_name }}"
           ORG="${{ github.repository_owner }}"
@@ -194,23 +199,28 @@ jobs:
           # GitHub CLI로 인증
           gh auth login --with-token <<< "$GH_TOKEN"
           
-          # 이슈 본문 생성 (escape 처리)
-          ISSUE_BODY="## Migrated from Hub Repository
-
-This issue was migrated from [hub#${{ github.event.issue.number }}](https://github.com/${{ github.repository }}/issues/${{ github.event.issue.number }}).
-
-### Original Author
-@${{ github.event.issue.user.login }}
-
-### Original Content
-
-${{ github.event.issue.body }}"
+          # 이슈 본문을 파일로 생성 (escape 문제 해결)
+          cat > issue_body.md << 'ISSUE_CONTENT_EOF'
+          ## Migrated from Hub Repository
+          
+          This issue was migrated from [hub#${ISSUE_NUMBER}](https://github.com/${REPO_URL}/issues/${ISSUE_NUMBER}).
+          
+          ### Original Author
+          @${ISSUE_AUTHOR}
+          
+          ### Original Content
+          
+          ${ISSUE_BODY}
+          ISSUE_CONTENT_EOF
+          
+          # 환경 변수 치환
+          envsubst < issue_body.md > issue_body_final.md
           
           # 새 레포지토리에 이슈 생성
           NEW_ISSUE_URL=$(gh issue create \
             --repo "$ORG/$REPO_NAME" \
-            --title "${{ github.event.issue.title }}" \
-            --body "$ISSUE_BODY" \
+            --title "$ISSUE_TITLE" \
+            --body-file issue_body_final.md \
             --label "migrated,service" 2>/dev/null || echo "")
           
           # 이슈 번호 추출
@@ -222,6 +232,9 @@ ${{ github.event.issue.body }}"
             echo "Warning: Could not create issue in new repository"
             echo "new_issue_number=1" >> $GITHUB_OUTPUT
           fi
+          
+          # 임시 파일 정리
+          rm -f issue_body.md issue_body_final.md
           
       - name: Update original issue
         uses: actions/github-script@v7
