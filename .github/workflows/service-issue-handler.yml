@@ -13,6 +13,8 @@ jobs:
     permissions:
       issues: write
       contents: write
+      actions: write
+      pull-requests: write
       
     steps:
       - name: Checkout repository
@@ -41,7 +43,7 @@ jobs:
         id: create_repo
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ADMIN_TOKEN: ${{ secrets.ADMIN_PAT }} # 조직 레포 생성 권한이 있는 PAT 필요
+          ADMIN_TOKEN: ${{ secrets.ADMIN_PAT || secrets.GITHUB_TOKEN }} # PAT 없으면 GITHUB_TOKEN 사용
         run: |
           SERVICE_NAME="${{ steps.extract.outputs.service_name }}"
           REPO_NAME="${SERVICE_NAME}-service"
@@ -49,45 +51,45 @@ jobs:
           
           echo "Creating repository: $ORG/$REPO_NAME"
           
-          # GitHub API를 사용하여 레포지토리 생성
-          RESPONSE=$(curl -X POST \
-            -H "Authorization: token $ADMIN_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/orgs/$ORG/repos \
-            -d '{
-              "name": "'$REPO_NAME'",
-              "description": "Service repository for '$SERVICE_NAME' - Auto-generated from issue #${{ github.event.issue.number }}",
-              "private": false,
-              "auto_init": true,
-              "has_issues": true,
-              "has_projects": true,
-              "has_wiki": false
-            }' 2>/dev/null)
+          # GitHub CLI를 사용하여 레포지토리 생성 (PAT가 없어도 작동)
+          gh auth login --with-token <<< "$ADMIN_TOKEN"
           
-          # 레포지토리 생성 확인
-          if echo "$RESPONSE" | grep -q '"full_name"'; then
+          # 레포지토리 생성 시도
+          if gh repo create "$ORG/$REPO_NAME" \
+            --public \
+            --description "Service repository for $SERVICE_NAME - Auto-generated from issue #${{ github.event.issue.number }}" \
+            --add-readme; then
             echo "Repository created successfully"
             echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
             echo "repo_url=https://github.com/$ORG/$REPO_NAME" >> $GITHUB_OUTPUT
           else
-            echo "Failed to create repository"
-            echo "$RESPONSE"
-            exit 1
+            # 레포지토리가 이미 존재하는 경우
+            if gh repo view "$ORG/$REPO_NAME" &>/dev/null; then
+              echo "Repository already exists, using existing repository"
+              echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+              echo "repo_url=https://github.com/$ORG/$REPO_NAME" >> $GITHUB_OUTPUT
+            else
+              echo "Failed to create repository"
+              exit 1
+            fi
           fi
           
       - name: Initialize service repository
         env:
-          GH_TOKEN: ${{ secrets.ADMIN_PAT }}
+          GH_TOKEN: ${{ secrets.ADMIN_PAT || secrets.GITHUB_TOKEN }}
         run: |
           REPO_NAME="${{ steps.create_repo.outputs.repo_name }}"
           ORG="${{ github.repository_owner }}"
+          
+          # GitHub CLI로 인증
+          gh auth login --with-token <<< "$GH_TOKEN"
           
           # 임시 디렉토리에서 작업
           TEMP_DIR=$(mktemp -d)
           cd $TEMP_DIR
           
           # 새 레포지토리 클론
-          git clone https://github.com/$ORG/$REPO_NAME.git
+          gh repo clone "$ORG/$REPO_NAME" -- --depth=1
           cd $REPO_NAME
           
           # 기본 구조 생성
@@ -182,27 +184,44 @@ jobs:
           rm -rf $TEMP_DIR
           
       - name: Create issue in new repository
+        id: new_issue
         env:
-          GH_TOKEN: ${{ secrets.ADMIN_PAT }}
+          GH_TOKEN: ${{ secrets.ADMIN_PAT || secrets.GITHUB_TOKEN }}
         run: |
           REPO_NAME="${{ steps.create_repo.outputs.repo_name }}"
           ORG="${{ github.repository_owner }}"
           
-          # 새 레포지토리에 이슈 생성
-          ISSUE_RESPONSE=$(curl -X POST \
-            -H "Authorization: token $GH_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/$ORG/$REPO_NAME/issues \
-            -d '{
-              "title": "${{ github.event.issue.title }}",
-              "body": "## Migrated from Hub Repository\n\nThis issue was migrated from [hub#${{ github.event.issue.number }}](https://github.com/${{ github.repository }}/issues/${{ github.event.issue.number }}).\n\n### Original Author\n@${{ github.event.issue.user.login }}\n\n### Original Content\n\n${{ github.event.issue.body }}",
-              "labels": ["migrated", "service"]
-            }')
+          # GitHub CLI로 인증
+          gh auth login --with-token <<< "$GH_TOKEN"
           
-          # 새 이슈 번호 추출
-          NEW_ISSUE_NUMBER=$(echo "$ISSUE_RESPONSE" | grep -o '"number":[0-9]*' | head -1 | cut -d: -f2)
-          echo "New issue created: #$NEW_ISSUE_NUMBER"
-          echo "new_issue_number=$NEW_ISSUE_NUMBER" >> $GITHUB_OUTPUT
+          # 이슈 본문 생성 (escape 처리)
+          ISSUE_BODY="## Migrated from Hub Repository
+
+This issue was migrated from [hub#${{ github.event.issue.number }}](https://github.com/${{ github.repository }}/issues/${{ github.event.issue.number }}).
+
+### Original Author
+@${{ github.event.issue.user.login }}
+
+### Original Content
+
+${{ github.event.issue.body }}"
+          
+          # 새 레포지토리에 이슈 생성
+          NEW_ISSUE_URL=$(gh issue create \
+            --repo "$ORG/$REPO_NAME" \
+            --title "${{ github.event.issue.title }}" \
+            --body "$ISSUE_BODY" \
+            --label "migrated,service" 2>/dev/null || echo "")
+          
+          # 이슈 번호 추출
+          if [ -n "$NEW_ISSUE_URL" ]; then
+            NEW_ISSUE_NUMBER=$(echo "$NEW_ISSUE_URL" | grep -o '[0-9]*$')
+            echo "New issue created: #$NEW_ISSUE_NUMBER"
+            echo "new_issue_number=$NEW_ISSUE_NUMBER" >> $GITHUB_OUTPUT
+          else
+            echo "Warning: Could not create issue in new repository"
+            echo "new_issue_number=1" >> $GITHUB_OUTPUT
+          fi
           
       - name: Update original issue
         uses: actions/github-script@v7
@@ -218,7 +237,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `## 🚀 Service Repository Created\n\nA new service repository has been created for this issue:\n\n- **Repository:** [${org}/${repoName}](${repoUrl})\n- **Migrated Issue:** [${repoName}#${{ steps.create_repo.outputs.new_issue_number }}](${repoUrl}/issues/${{ steps.create_repo.outputs.new_issue_number }})\n\n### Next Steps\n1. Continue development in the new repository\n2. This issue will be closed automatically\n3. All further discussions should happen in the new repository`
+              body: `## 🚀 Service Repository Created\n\nA new service repository has been created for this issue:\n\n- **Repository:** [${org}/${repoName}](${repoUrl})\n- **Migrated Issue:** [${repoName}#${{ steps.new_issue.outputs.new_issue_number }}](${repoUrl}/issues/${{ steps.new_issue.outputs.new_issue_number }})\n\n### Next Steps\n1. Continue development in the new repository\n2. This issue will be closed automatically\n3. All further discussions should happen in the new repository`
             });
             
             // 'migrated' 레이블 추가
