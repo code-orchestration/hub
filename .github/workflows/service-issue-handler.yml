@@ -1,0 +1,239 @@
+name: Service Issue Handler
+
+on:
+  issues:
+    types: [opened, labeled]
+
+jobs:
+  handle-service-issue:
+    runs-on: ubuntu-latest
+    # 이슈에 'service' 레이블이 있을 때만 실행
+    if: contains(github.event.issue.labels.*.name, 'service')
+    
+    permissions:
+      issues: write
+      contents: write
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Setup GitHub CLI
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+          
+      - name: Extract service name from issue
+        id: extract
+        run: |
+          # 이슈 제목에서 서비스 이름 추출 (예: "[Service] my-app" -> "my-app")
+          SERVICE_NAME=$(echo "${{ github.event.issue.title }}" | sed -n 's/.*\[Service\]\s*\(.*\)/\1/p' | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
+          
+          # 서비스 이름이 없으면 이슈 번호를 사용
+          if [ -z "$SERVICE_NAME" ]; then
+            SERVICE_NAME="service-${{ github.event.issue.number }}"
+          fi
+          
+          echo "service_name=$SERVICE_NAME" >> $GITHUB_OUTPUT
+          echo "Service name: $SERVICE_NAME"
+          
+      - name: Create new repository
+        id: create_repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ADMIN_TOKEN: ${{ secrets.ADMIN_PAT }} # 조직 레포 생성 권한이 있는 PAT 필요
+        run: |
+          SERVICE_NAME="${{ steps.extract.outputs.service_name }}"
+          REPO_NAME="${SERVICE_NAME}-service"
+          ORG="${{ github.repository_owner }}"
+          
+          echo "Creating repository: $ORG/$REPO_NAME"
+          
+          # GitHub API를 사용하여 레포지토리 생성
+          RESPONSE=$(curl -X POST \
+            -H "Authorization: token $ADMIN_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/orgs/$ORG/repos \
+            -d '{
+              "name": "'$REPO_NAME'",
+              "description": "Service repository for '$SERVICE_NAME' - Auto-generated from issue #${{ github.event.issue.number }}",
+              "private": false,
+              "auto_init": true,
+              "has_issues": true,
+              "has_projects": true,
+              "has_wiki": false
+            }' 2>/dev/null)
+          
+          # 레포지토리 생성 확인
+          if echo "$RESPONSE" | grep -q '"full_name"'; then
+            echo "Repository created successfully"
+            echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+            echo "repo_url=https://github.com/$ORG/$REPO_NAME" >> $GITHUB_OUTPUT
+          else
+            echo "Failed to create repository"
+            echo "$RESPONSE"
+            exit 1
+          fi
+          
+      - name: Initialize service repository
+        env:
+          GH_TOKEN: ${{ secrets.ADMIN_PAT }}
+        run: |
+          REPO_NAME="${{ steps.create_repo.outputs.repo_name }}"
+          ORG="${{ github.repository_owner }}"
+          
+          # 임시 디렉토리에서 작업
+          TEMP_DIR=$(mktemp -d)
+          cd $TEMP_DIR
+          
+          # 새 레포지토리 클론
+          git clone https://github.com/$ORG/$REPO_NAME.git
+          cd $REPO_NAME
+          
+          # 기본 구조 생성
+          cat > README.md << EOF
+          # ${{ steps.extract.outputs.service_name }} Service
+          
+          This repository was auto-generated from issue #${{ github.event.issue.number }} in the hub repository.
+          
+          ## Original Issue
+          
+          **Title:** ${{ github.event.issue.title }}
+          **Author:** @${{ github.event.issue.user.login }}
+          **Created:** ${{ github.event.issue.created_at }}
+          
+          ## Issue Content
+          
+          ${{ github.event.issue.body }}
+          
+          ## Links
+          
+          - [Original Issue](https://github.com/${{ github.repository }}/issues/${{ github.event.issue.number }})
+          - [Hub Repository](https://github.com/${{ github.repository }})
+          EOF
+          
+          # 기본 디렉토리 구조 생성
+          mkdir -p src docs tests .github/workflows
+          
+          # 기본 .gitignore 생성
+          cat > .gitignore << EOF
+          # Dependencies
+          node_modules/
+          vendor/
+          
+          # Build outputs
+          dist/
+          build/
+          *.exe
+          *.dll
+          *.so
+          *.dylib
+          
+          # Environment files
+          .env
+          .env.local
+          .env.*.local
+          
+          # IDE
+          .vscode/
+          .idea/
+          *.swp
+          *.swo
+          
+          # Logs
+          logs/
+          *.log
+          
+          # OS
+          .DS_Store
+          Thumbs.db
+          EOF
+          
+          # 기본 CI/CD 워크플로우 생성
+          cat > .github/workflows/ci.yml << 'EOF'
+          name: CI
+          
+          on:
+            push:
+              branches: [ main ]
+            pull_request:
+              branches: [ main ]
+          
+          jobs:
+            build:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v4
+                - name: Build
+                  run: echo "Build step placeholder"
+                - name: Test
+                  run: echo "Test step placeholder"
+          EOF
+          
+          # 변경사항 커밋 및 푸시
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add .
+          git commit -m "Initialize service repository from issue #${{ github.event.issue.number }}"
+          git push origin main
+          
+          # 정리
+          cd /
+          rm -rf $TEMP_DIR
+          
+      - name: Create issue in new repository
+        env:
+          GH_TOKEN: ${{ secrets.ADMIN_PAT }}
+        run: |
+          REPO_NAME="${{ steps.create_repo.outputs.repo_name }}"
+          ORG="${{ github.repository_owner }}"
+          
+          # 새 레포지토리에 이슈 생성
+          ISSUE_RESPONSE=$(curl -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/$ORG/$REPO_NAME/issues \
+            -d '{
+              "title": "${{ github.event.issue.title }}",
+              "body": "## Migrated from Hub Repository\n\nThis issue was migrated from [hub#${{ github.event.issue.number }}](https://github.com/${{ github.repository }}/issues/${{ github.event.issue.number }}).\n\n### Original Author\n@${{ github.event.issue.user.login }}\n\n### Original Content\n\n${{ github.event.issue.body }}",
+              "labels": ["migrated", "service"]
+            }')
+          
+          # 새 이슈 번호 추출
+          NEW_ISSUE_NUMBER=$(echo "$ISSUE_RESPONSE" | grep -o '"number":[0-9]*' | head -1 | cut -d: -f2)
+          echo "New issue created: #$NEW_ISSUE_NUMBER"
+          echo "new_issue_number=$NEW_ISSUE_NUMBER" >> $GITHUB_OUTPUT
+          
+      - name: Update original issue
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const repoName = '${{ steps.create_repo.outputs.repo_name }}';
+            const repoUrl = '${{ steps.create_repo.outputs.repo_url }}';
+            const org = context.repo.owner;
+            
+            // 원본 이슈에 댓글 추가
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## 🚀 Service Repository Created\n\nA new service repository has been created for this issue:\n\n- **Repository:** [${org}/${repoName}](${repoUrl})\n- **Migrated Issue:** [${repoName}#${{ steps.create_repo.outputs.new_issue_number }}](${repoUrl}/issues/${{ steps.create_repo.outputs.new_issue_number }})\n\n### Next Steps\n1. Continue development in the new repository\n2. This issue will be closed automatically\n3. All further discussions should happen in the new repository`
+            });
+            
+            // 'migrated' 레이블 추가
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['migrated']
+            });
+            
+            // 원본 이슈 닫기
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              state: 'closed',
+              state_reason: 'completed'
+            });
